@@ -1,0 +1,115 @@
+name: Android v1.8 reusable build-matrix acceptance
+on:
+  push:
+    branches: [sandbox/android-engine-v1.8]
+    paths: ['.github/workflows/android-universal-v18.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: functional-java
+            repository: hjcauser/TagMo
+            commit: 528e3c3f7a1a2b199510c3fe85ecdfabe94236ca
+            project_dir: sandbox-android
+            task: ':app:assembleDebug'
+            artifact_dir: sandbox-android/app/build/outputs/apk/debug
+            sdk: '35'
+          - id: fossify-calculator
+            repository: FossifyOrg/Calculator
+            commit: 77e2490684d5722e25d177608792b8e35610e990
+            project_dir: '.'
+            task: ':app:assembleFossDebug'
+            artifact_dir: app/build/outputs/apk/foss/debug
+            sdk: '36'
+    steps:
+      - name: Validate allowlisted build profile
+        env:
+          REPO: ${{ matrix.repository }}
+          COMMIT: ${{ matrix.commit }}
+          PROJECT_DIR: ${{ matrix.project_dir }}
+          TASK: ${{ matrix.task }}
+          ARTIFACT_DIR: ${{ matrix.artifact_dir }}
+          SDK_API: ${{ matrix.sdk }}
+        run: |
+          python3 - <<'PY'
+          import os,re,pathlib
+          a=os.environ
+          assert re.fullmatch(r'[\w.-]+/[\w.-]+', a['REPO'])
+          assert re.fullmatch(r'[0-9a-f]{40}', a['COMMIT'])
+          assert re.fullmatch(r':app:assemble[A-Za-z0-9]+',a['TASK'])
+          assert a['SDK_API'] in {'35','36'}
+          for key in ('PROJECT_DIR','ARTIFACT_DIR'):
+              s=a[key]; p=pathlib.PurePosixPath(s)
+              assert s and not p.is_absolute() and '..' not in p.parts and '\\' not in s
+          PY
+      - name: Checkout exact pinned upstream commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.commit }}
+          path: upstream
+          persist-credentials: false
+      - name: Verify checked-out source identity
+        env:
+          COMMIT: ${{ matrix.commit }}
+        run: |
+          test "$(git -C upstream rev-parse HEAD)" = "$COMMIT"
+          test -z "$(git -C upstream status --porcelain)"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install matching Android SDK
+        env:
+          SDK_API: ${{ matrix.sdk }}
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-$SDK_API" 'build-tools;36.0.0'
+          test -s "$ANDROID_HOME/platforms/android-$SDK_API/android.jar"
+      - name: Build pinned source without modifications
+        env:
+          PROJECT_DIR: ${{ matrix.project_dir }}
+          TASK: ${{ matrix.task }}
+        run: |
+          set -euo pipefail
+          cd "upstream/$PROJECT_DIR"
+          gradle --no-daemon --max-workers=2 --console=plain "$TASK" --stacktrace
+      - name: Check APK signatures and archive integrity
+        env:
+          PROFILE: ${{ matrix.id }}
+          REPO: ${{ matrix.repository }}
+          COMMIT: ${{ matrix.commit }}
+          ARTIFACT_DIR: ${{ matrix.artifact_dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p delivery
+          mapfile -t apks < <(find "upstream/$ARTIFACT_DIR" -maxdepth 1 -type f -name '*.apk' | sort)
+          test "${#apks[@]}" -eq 1
+          apk="${apks[0]}"
+          test -s "$apk"
+          unzip -t "$apk" | tail -n 2
+          unzip -l "$apk" | grep -E 'classes.dex|AndroidManifest.xml'
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk" > delivery/apksigner.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" > delivery/badging.txt
+          cp "$apk" "delivery/$PROFILE.apk"
+          (cd delivery && sha256sum "$PROFILE.apk" > SHA256SUMS.txt)
+          printf 'profile=%s\nsource=https://github.com/%s\nsource_commit=%s\nrun=%s\n' "$PROFILE" "$REPO" "$COMMIT" "$GITHUB_RUN_ID" > delivery/provenance.txt
+      - name: Upload signed build and receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-v18-${{ matrix.id }}
+          path: delivery/
+          retention-days: 30
