@@ -1,0 +1,73 @@
+name: Sandbox v1.7 - Fossify Calculator upstream APK
+on:
+  push:
+    branches: [sandbox/android-upstream-v1.7]
+    paths:
+      - '.github/workflows/android-upstream-v17.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact official upstream release
+        uses: actions/checkout@v4
+        with:
+          repository: FossifyOrg/Calculator
+          ref: 77e2490684d5722e25d177608792b8e35610e990
+          path: upstream
+          persist-credentials: false
+      - name: Verify source identity
+        run: |
+          set -euo pipefail
+          cd upstream
+          test "$(git rev-parse HEAD)" = '77e2490684d5722e25d177608792b8e35610e990'
+          grep -q '^VERSION_NAME=1.4.0$' gradle.properties
+          grep -q '^VERSION_CODE=10$' gradle.properties
+          grep -q 'GPL' LICENSE
+          git status --porcelain
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Provision Android SDK 36 and capture tools
+        run: |
+          set -euo pipefail
+          test -n "${ANDROID_HOME:-}"
+          command -v sdkmanager
+          sdkmanager --install 'platforms;android-36' 'build-tools;36.0.0'
+          test -s "$ANDROID_HOME/platforms/android-36/android.jar"
+          java -version
+          gradle --version
+      - name: Compile upstream Fossify debug flavor
+        working-directory: upstream
+        run: gradle --no-daemon --max-workers=2 --console=plain :app:assembleFossDebug --stacktrace
+      - name: Inspect APK and capture provenance
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          mapfile -t apks < <(find upstream/app/build/outputs/apk/foss/debug -type f -name '*.apk' -print | sort)
+          test "${#apks[@]}" -eq 1
+          apk="${apks[0]}"
+          test -s "$apk"
+          unzip -t "$apk" | tail -n 2
+          unzip -l "$apk" | grep -E 'classes.dex|AndroidManifest.xml'
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$apk" > evidence/signature.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$apk" > evidence/badging.txt
+          sha256sum "$apk" > evidence/sha256-full-path.txt
+          printf '%s  %s\n' "$(sha256sum "$apk" | awk '{print $1}')" "$(basename "$apk")" > evidence/SHA256SUMS.txt
+          printf 'repository=https://github.com/FossifyOrg/Calculator\ntag=1.4.0\nsha=77e2490684d5722e25d177608792b8e35610e990\nworkflow=%s\n' "$GITHUB_RUN_ID" > evidence/provenance.txt
+          find upstream/app/build/outputs/apk/foss/debug -maxdepth 1 -type f -printf '%f %s bytes\n'
+      - name: Upload debug APK and verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: fossify-calculator-1.4.0-debug-v17
+          path: |
+            upstream/app/build/outputs/apk/foss/debug/*.apk
+            evidence/*.txt
+          retention-days: 30
