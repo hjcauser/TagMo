@@ -1,0 +1,66 @@
+name: REA v1.11 real-package smoke
+on:
+  push:
+    branches: [sandbox/rea-v111-validation]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.22.1
+          registry-url: https://registry.npmjs.org
+      - name: dotnet SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Install pinned REA and run static managed inspection
+        shell: bash
+        run: |
+          set -euxo pipefail
+          node -v
+          npm install --prefix "$RUNNER_TEMP/rea" --no-audit --no-fund rea-agents@6.8.0
+          node -e "let p=require(process.env.RUNNER_TEMP+'/rea/node_modules/rea-agents/package.json');if(p.version!=='6.8.0')process.exit(1)"
+          node "$RUNNER_TEMP/rea/node_modules/rea-agents/scripts/rea.mjs" --help > "$RUNNER_TEMP/help.txt"
+          mkdir -p "$RUNNER_TEMP/demo"
+          cd "$RUNNER_TEMP/demo"
+          printf '%s\n' '<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework><OutputType>Library</OutputType></PropertyGroup></Project>' > Demo.csproj
+          printf '%s\n' 'public static class Demo {public static int Add(int x,int y)=>x+y;}' > Demo.cs
+          dotnet build -c Release --nologo
+          node "$RUNNER_TEMP/rea/node_modules/rea-agents/scripts/rea.mjs" inspect-managed-artifact "$PWD/bin/Release/net8.0/Demo.dll" --json > "$RUNNER_TEMP/managed.json"
+          python3 - <<'PY'
+          import os, pathlib, json
+          p=pathlib.Path(os.environ['RUNNER_TEMP'])/'managed.json'
+          data=json.loads(p.read_text())
+          assert data.get('ok') is not False, str(data)[:500]
+          assert data.get('normalized_result') is not None, str(data)[:500]
+          print('REA_REAL_INSPECTION_PASS')
+          PY
+      - name: Save evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,json,pathlib,hashlib
+          d=pathlib.Path(os.environ['RUNNER_TEMP'])
+          paths=['help.txt','managed.json']
+          out={'source':'morluto/rea','version':'6.8.0','release_commit':'160d821ac9a0310afcb8d1fc427862dd6508add5','workflow_commit':os.getenv('GITHUB_SHA'),'files':{}}
+          for name in paths:
+            p=d/name
+            if p.is_file():out['files'][name]={'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+          (d/'rea-evidence.json').write_text(json.dumps(out,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rea-v111-ci-evidence
+          path: |
+            ${{ runner.temp }}/rea-evidence.json
+            ${{ runner.temp }}/managed.json
+            ${{ runner.temp }}/help.txt
+          if-no-files-found: warn
